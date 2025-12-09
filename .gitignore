@@ -6,3 +6,4 @@ app/core/__pycache__/
 app/repositories/__pycache__/
 app/schemas/__pycache__/
 app/services/__pycache__/
+app/adapters/email/__pycache__/
