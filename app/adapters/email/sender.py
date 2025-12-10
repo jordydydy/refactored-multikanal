@@ -43,9 +43,7 @@ class EmailAdapter(BaseAdapter):
                 authority=f"https://login.microsoftonline.com/{settings.AZURE_TENANT_ID}",
                 client_credential=settings.AZURE_CLIENT_SECRET,
             )
-            
             result = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
-            
             if "access_token" in result:
                 self._token_cache = {
                     "access_token": result["access_token"],
@@ -56,17 +54,16 @@ class EmailAdapter(BaseAdapter):
             else:
                 logger.error(f"Failed to acquire Graph token: {result.get('error_description')}")
                 return None
-                
         except Exception as e:
             logger.error(f"Azure Auth Exception: {e}")
             return None
 
     def send_message(self, recipient_id: str, text: str, **kwargs):
         subject = kwargs.get("subject", "Re: Your Inquiry")
-        # Kita tidak bisa menggunakan in_reply_to di Graph API sendMail,
-        # jadi variabel ini tidak kita pakai untuk Azure.
         in_reply_to = kwargs.get("in_reply_to")
         references = kwargs.get("references")
+        # [FIX] Ambil graph_message_id yang dikirim Orchestrator
+        graph_message_id = kwargs.get("graph_message_id")
         
         text = self._convert_markdown_to_html(text)
         html_body = text.replace('\n', '<br>')
@@ -77,29 +74,45 @@ class EmailAdapter(BaseAdapter):
         )
 
         if settings.EMAIL_PROVIDER == "azure_oauth2":
-            return self._send_via_graph(recipient_id, subject, formatted_body)
+            return self._send_via_graph(recipient_id, subject, formatted_body, graph_message_id)
         else:
             return self._send_via_smtp(recipient_id, subject, formatted_body, in_reply_to, references)
 
-    def _send_via_graph(self, to_email: str, subject: str, html_body: str):
+    def _send_via_graph(self, to_email: str, subject: str, html_body: str, graph_message_id: str = None):
         """
-        Mengirim email menggunakan Microsoft Graph API.
-        [FIX] Menghapus 'internetMessageHeaders' karena Graph API menolak
-        setting manual In-Reply-To pada endpoint sendMail.
+        Mengirim email via Graph API.
+        - Jika ada 'graph_message_id', gunakan endpoint '/reply' (Threading Native).
+        - Jika tidak ada, gunakan 'sendMail' (New Thread).
         """
         token = self._get_graph_token()
         if not token:
             return {"sent": False, "error": "Could not acquire Azure token"}
 
         user_id = settings.AZURE_EMAIL_USER
-        url = f"https://graph.microsoft.com/v1.0/users/{user_id}/sendMail"
-        
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json"
         }
 
-        # Payload Bersih (Tanpa Header Konflik)
+        # [LOGIKA 1: REPLY THREADING]
+        # Endpoint ini yang akan memaksa email masuk ke thread yang sama!
+        if graph_message_id:
+            logger.info(f"Replying to existing thread using Graph ID: {graph_message_id}")
+            url = f"https://graph.microsoft.com/v1.0/users/{user_id}/messages/{graph_message_id}/reply"
+            payload = {
+                "comment": html_body  # Hanya perlu body baru
+            }
+            try:
+                response = requests.post(url, json=payload, headers=headers, timeout=10)
+                if response.status_code == 202:
+                    return {"sent": True, "method": "azure_graph_reply"}
+                else:
+                    logger.warning(f"Graph Reply Failed ({response.status_code}). Fallback to sendMail.")
+            except Exception as e:
+                logger.error(f"Graph Reply Exception: {e}")
+
+        # [LOGIKA 2: SEND NEW MAIL] (Fallback / Default)
+        url = f"https://graph.microsoft.com/v1.0/users/{user_id}/sendMail"
         email_msg = {
             "message": {
                 "subject": subject,
@@ -107,47 +120,38 @@ class EmailAdapter(BaseAdapter):
                     "contentType": "HTML",
                     "content": html_body
                 },
-                "toRecipients": [
-                    {
-                        "emailAddress": {"address": to_email}
-                    }
-                ]
+                "toRecipients": [{"emailAddress": {"address": to_email}}]
             },
             "saveToSentItems": "true"
         }
 
         try:
             response = requests.post(url, json=email_msg, headers=headers, timeout=10)
-            
             if response.status_code == 202:
-                logger.info(f"Email sent via Azure Graph API to {to_email}")
-                return {"sent": True, "method": "azure_graph"}
+                logger.info(f"Email sent via Azure sendMail to {to_email}")
+                return {"sent": True, "method": "azure_graph_send"}
             else:
                 logger.error(f"Graph API Error {response.status_code}: {response.text}")
                 return {"sent": False, "error": response.text}
-                
         except Exception as e:
             logger.error(f"Graph API Exception: {e}")
             return {"sent": False, "error": str(e)}
 
     def _send_via_smtp(self, to_email, subject, html_body, in_reply_to, references):
+        # ... (Logika SMTP tetap sama) ...
         try:
             msg = MIMEMultipart()
             msg['From'] = settings.SMTP_USERNAME or settings.EMAIL_USER
             msg['To'] = to_email
             msg['Subject'] = subject
             msg['Message-ID'] = make_msgid()
-            
             if in_reply_to: msg['In-Reply-To'] = in_reply_to
             if references: msg['References'] = references
-
             msg.attach(MIMEText(html_body, 'html'))
-
             with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT) as server:
                 server.starttls()
                 server.login(settings.EMAIL_USER, settings.EMAIL_PASS)
                 server.send_message(msg)
-            
             return {"sent": True, "message_id": msg['Message-ID']}
         except Exception as e:
             logger.error(f"SMTP Error: {e}")

@@ -5,7 +5,7 @@ import requests
 import logging
 import msal
 from email.header import decode_header
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Set
 
 from app.core.config import settings
 from app.adapters.email.utils import sanitize_email_body
@@ -14,14 +14,14 @@ from app.repositories.message import MessageRepository
 logger = logging.getLogger("email.listener")
 repo = MessageRepository()
 
-# --- Cache Token untuk Graph API ---
 _token_cache: Dict[str, Any] = {}
 
+# [FIX] Memory Cache untuk mencegah Race Condition (Double Processing)
+# Menyimpan ID pesan yang sedang diproses dalam runtime ini
+_processing_cache: Set[str] = set()
+
 def get_graph_token() -> Optional[str]:
-    """Mendapatkan Access Token OAuth2 untuk Microsoft Graph (Listener)."""
     global _token_cache
-    
-    # Cek Cache
     if _token_cache and _token_cache.get("expires_at", 0) > time.time() + 60:
         return _token_cache.get("access_token")
 
@@ -35,10 +35,7 @@ def get_graph_token() -> Optional[str]:
             authority=f"https://login.microsoftonline.com/{settings.AZURE_TENANT_ID}",
             client_credential=settings.AZURE_CLIENT_SECRET,
         )
-        
-        # Request token dengan scope default
         result = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
-        
         if "access_token" in result:
             _token_cache = {
                 "access_token": result["access_token"],
@@ -49,7 +46,6 @@ def get_graph_token() -> Optional[str]:
         else:
             logger.error(f"Failed to acquire Graph token: {result.get('error_description')}")
             return None
-            
     except Exception as e:
         logger.error(f"Azure Auth Exception in Listener: {e}")
         return None
@@ -65,8 +61,7 @@ def decode_str(header_val):
             text += str(content)
     return text
 
-def process_single_email(sender_email, sender_name, subject, body, msg_id, references, thread_key):
-    """Fungsi helper untuk mengirim data email yang sudah bersih ke Orchestrator."""
+def process_single_email(sender_email, sender_name, subject, body, msg_id, references, thread_key, graph_message_id=None):
     if "mailer-daemon" in sender_email.lower() or "noreply" in sender_email.lower():
         return
 
@@ -79,7 +74,8 @@ def process_single_email(sender_email, sender_name, subject, body, msg_id, refer
             "in_reply_to": msg_id,
             "references": references,
             "sender_name": sender_name,
-            "thread_key": thread_key
+            "thread_key": thread_key,
+            "graph_message_id": graph_message_id
         }
     }
     
@@ -90,13 +86,11 @@ def process_single_email(sender_email, sender_name, subject, body, msg_id, refer
     except Exception as req_err:
         logger.error(f"Failed to push email to API: {req_err}")
 
-# --- LOGIKA 1: GRAPH API LISTENER (AZURE) ---
 def _poll_graph_api():
     token = get_graph_token()
     if not token: return
 
     user_id = settings.AZURE_EMAIL_USER
-    # Ambil email yang belum dibaca (isRead=false)
     url = f"https://graph.microsoft.com/v1.0/users/{user_id}/mailFolders/inbox/messages"
     params = {
         "$filter": "isRead eq false",
@@ -119,13 +113,23 @@ def _poll_graph_api():
             graph_id = msg.get("id")
             msg_id = msg.get("internetMessageId", "").strip()
             
-            # Deduplikasi
-            if repo.is_processed(msg_id, "email"):
-                # Tetap tandai read agar tidak ditarik terus
-                _mark_graph_read(user_id, graph_id, token)
+            # [FIX] Deduplikasi Level 1: Memory Check
+            if msg_id in _processing_cache:
+                logger.info(f"Skipping duplicate in-memory: {msg_id}")
                 continue
 
-            # Parsing Data
+            # [FIX] Deduplikasi Level 2: Database Check
+            if repo.is_processed(msg_id, "email"):
+                _mark_graph_read(user_id, graph_id, token)
+                continue
+            
+            # Masukkan ke cache memori agar tidak diproses ulang di loop ini
+            _processing_cache.add(msg_id)
+
+            # Batasi ukuran cache agar RAM aman
+            if len(_processing_cache) > 1000:
+                _processing_cache.clear()
+
             subject = msg.get("subject", "")
             sender_info = msg.get("from", {}).get("emailAddress", {})
             sender_email = sender_info.get("address", "")
@@ -134,7 +138,6 @@ def _poll_graph_api():
             body_content = msg.get("body", {}).get("content", "")
             body_type = msg.get("body", {}).get("contentType", "Text")
             
-            # Cleaning Body
             if body_type.lower() == "html":
                 clean_body = sanitize_email_body(None, body_content)
             else:
@@ -144,11 +147,9 @@ def _poll_graph_api():
                 _mark_graph_read(user_id, graph_id, token)
                 continue
 
-            # Threading Logic dari Header
             headers_list = msg.get("internetMessageHeaders", []) or []
             references = ""
             in_reply_to = ""
-            
             for h in headers_list:
                 h_name = h.get("name", "").lower()
                 if h_name == "references":
@@ -163,10 +164,8 @@ def _poll_graph_api():
             else:
                 thread_key = msg_id
 
-            # Proses
-            process_single_email(sender_email, sender_name, subject, clean_body, msg_id, references, thread_key)
+            process_single_email(sender_email, sender_name, subject, clean_body, msg_id, references, thread_key, graph_id)
             
-            # Tandai sudah dibaca
             _mark_graph_read(user_id, graph_id, token)
 
     except Exception as e:
@@ -183,7 +182,6 @@ def _mark_graph_read(user_id, message_id, token):
     except Exception:
         pass
 
-# --- LOGIKA 2: IMAP LISTENER (GMAIL/BASIC) ---
 def _poll_imap():
     try:
         mail = imaplib.IMAP4_SSL(settings.EMAIL_HOST, settings.EMAIL_PORT)
@@ -203,15 +201,19 @@ def _poll_imap():
             
             msg_id = msg.get("Message-ID", "").strip()
             
-            if repo.is_processed(msg_id, "email"):
-                continue
+            # Deduplikasi Memory & DB
+            if msg_id in _processing_cache: continue
+            if repo.is_processed(msg_id, "email"): continue
+            
+            _processing_cache.add(msg_id)
+            if len(_processing_cache) > 1000: _processing_cache.clear()
             
             subject = decode_str(msg.get("Subject"))
             sender = decode_str(msg.get("From"))
             sender_email = sender.split('<')[-1].replace('>', '').strip() if '<' in sender else sender
             sender_name = sender.split('<')[0].strip()
 
-            text_plain, html = "", ""
+            text_plain, html = ""
             if msg.is_multipart():
                 for part in msg.walk():
                     if part.get_content_type() == "text/plain":
@@ -234,7 +236,7 @@ def _poll_imap():
             else:
                 thread_key = msg_id
 
-            process_single_email(sender_email, sender_name, subject, clean_body, msg_id, references, thread_key)
+            process_single_email(sender_email, sender_name, subject, clean_body, msg_id, references, thread_key, None)
 
         mail.close()
         mail.logout()
@@ -242,9 +244,7 @@ def _poll_imap():
     except Exception as e:
         logger.error(f"IMAP Loop Error: {e}")
 
-# --- MAIN LOOP ---
 def start_email_listener():
-    """Loop utama."""
     if not settings.EMAIL_USER:
         logger.warning("Email credentials not set. Listener stopped.")
         return
@@ -256,5 +256,4 @@ def start_email_listener():
             _poll_graph_api()
         else:
             _poll_imap()
-        
         time.sleep(settings.EMAIL_POLL_INTERVAL_SECONDS)
