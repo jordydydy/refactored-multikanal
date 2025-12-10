@@ -9,8 +9,6 @@ import logging
 logger = logging.getLogger("api.routes")
 router = APIRouter()
 
-# --- Verification Endpoints (Tetap Sama) ---
-
 @router.get("/whatsapp/webhook")
 def verify_whatsapp(
     mode: str = Query(..., alias="hub.mode"),
@@ -30,8 +28,6 @@ def verify_instagram(
     if mode == "subscribe" and token == settings.INSTAGRAM_VERIFY_TOKEN:
         return Response(content=challenge, media_type="text/plain")
     raise HTTPException(status_code=403, detail="Verification failed")
-
-# --- Inbound Webhooks (WA & IG) ---
 
 @router.post("/whatsapp/webhook")
 async def whatsapp_webhook(
@@ -69,25 +65,9 @@ async def instagram_webhook(
             
     return {"status": "ok"}
 
-# --- Callback Endpoint (Backend AI -> Multikarnal) ---
-
 @router.post("/api/send/reply")
-async def handle_backend_callback(
-    request: Request,
-    bg_tasks: BackgroundTasks,
-    orchestrator: MessageOrchestrator = Depends(get_orchestrator)
-):
-    try:
-        payload = await request.json()
-        logger.info(f"Received Callback from Backend: {payload}")
-        
-        # Panggil fungsi khusus di orchestrator untuk menangani pesan keluar
-        bg_tasks.add_task(orchestrator.send_manual_message, payload)
-        
-        return {"status": "processing"}
-    except Exception as e:
-        logger.error(f"Error processing backend callback: {e}")
-        return {"status": "error", "detail": str(e)}
+async def ignore_backend_callback(request: Request):
+    return {"status": "ignored"}
 
 @router.post("/api/messages/process")
 async def process_message_internal(

@@ -1,6 +1,6 @@
 import asyncio
 import httpx
-from typing import Dict, Any
+from typing import Dict
 from app.schemas.models import IncomingMessage
 from app.repositories.conversation import ConversationRepository
 from app.repositories.message import MessageRepository
@@ -31,7 +31,6 @@ class MessageOrchestrator:
         logger.info(f"TIMEOUT: Auto-closing session {conversation_id} for {platform} user {user_id}")
 
         try:
-            # Kirim sinyal close ke AI (tanpa menunggu jawaban penting)
             await self.chatbot.ask(
                 query="Terima Kasih", 
                 conversation_id=conversation_id, 
@@ -82,41 +81,23 @@ class MessageOrchestrator:
         except Exception as e:
             logger.error(f"Gagal kirim feedback: {e}")
 
-    async def send_manual_message(self, data: Dict[str, Any]):
+    async def send_manual_message(self, data: dict):
         payload = data.get("data") if "data" in data else data
-        
         user_id = payload.get("user") or payload.get("platform_unique_id") or payload.get("recipient_id")
         platform = payload.get("platform")
         answer = payload.get("answer") or payload.get("message")
         conversation_id = payload.get("conversation_id")
-        
         answer_id = payload.get("answer_id")
-
-        if not user_id or not answer or not platform: 
-            logger.warning(f"Invalid payload for manual message: {payload}")
-            return
-
+        if not user_id or not answer or not platform: return
         adapter = self.adapters.get(platform)
-        if not adapter: 
-            logger.warning(f"No adapter found for platform: {platform}")
-            return
-
-        try:
-            adapter.send_typing_off(user_id)
-        except Exception: pass
-
+        if not adapter: return
         send_kwargs = {}
         if platform == "email":
             meta = self.repo_msg.get_email_metadata(conversation_id) if conversation_id else None
-            if meta: 
-                send_kwargs = meta
-            else: 
-                send_kwargs = {"subject": "Re: Your Inquiry"}
-
+            if meta: send_kwargs = meta
+            else: send_kwargs = {"subject": "Re: Your Inquiry"}
         adapter.send_message(user_id, answer, **send_kwargs)
-        
-        if answer_id: 
-            adapter.send_feedback_request(user_id, answer_id)
+        if answer_id: adapter.send_feedback_request(user_id, answer_id)
 
     async def process_message(self, msg: IncomingMessage):
         adapter = self.adapters.get(msg.platform)
@@ -142,8 +123,40 @@ class MessageOrchestrator:
 
         try:
             response = await self.chatbot.ask(msg.query, msg.conversation_id, msg.platform, msg.platform_unique_id)
+        except Exception as e:
+            logger.error(f"Critical error during chatbot processing: {e}")
+            response = None
+
+        try:
+            adapter.send_typing_off(msg.platform_unique_id)
+        except Exception: pass
+
+        if not response or not response.answer:
+            return 
+
+        send_kwargs = {}
+        if msg.platform == "email":
+            if msg.metadata:
+                send_kwargs = {
+                    "subject": msg.metadata.get("subject"),
+                    "in_reply_to": msg.metadata.get("in_reply_to"),
+                    "references": msg.metadata.get("references"),
+                    "graph_message_id": msg.metadata.get("graph_message_id")
+                }
+            else:
+                meta = self.repo_msg.get_email_metadata(response.conversation_id or msg.conversation_id)
+                if meta: send_kwargs = meta
+
+        adapter.send_message(msg.platform_unique_id, response.answer, **send_kwargs)
+
+        raw_data = response.raw.get("data", {}) if response.raw else {}
+        answer_id = raw_data.get("answer_id")
+        if answer_id:
+            adapter.send_feedback_request(msg.platform_unique_id, answer_id)
             
-            if msg.platform == "email" and response.conversation_id and msg.metadata:
+        if msg.platform == "email" and response.conversation_id and msg.metadata:
+            current_thread_session = self.repo_msg.get_conversation_by_thread(msg.metadata.get("thread_key"))
+            if not current_thread_session or current_thread_session == response.conversation_id:
                 self.repo_msg.save_email_metadata(
                     response.conversation_id,
                     msg.metadata.get("subject", ""),
@@ -151,6 +164,3 @@ class MessageOrchestrator:
                     msg.metadata.get("references", ""),
                     msg.metadata.get("thread_key", "")
                 )
-                
-        except Exception as e:
-            logger.error(f"Critical error during chatbot processing: {e}")
